@@ -1,0 +1,88 @@
+# Default configuration for Self-Instruct pipeline
+
+# vLLM server configuration
+vllm:
+  base_url: "http://localhost:8000"
+  model_name: "google/gemma-3-27b-pt"  # Base pre-trained model
+  
+# Generation configurations for different tasks
+generation:
+  # For instruction generation
+  instruction:
+    temperature: 0.7
+    max_tokens: 1024
+    top_p: 0.5
+    frequency_penalty: 0.0
+    presence_penalty: 2.0  # Strong penalty like original paper
+    stop:
+      - "\n\n"
+      - "\n16"
+      - "16."
+      - "16 ."
+    
+  # For task classification
+  classification:
+    temperature: 0.1  # Low temperature for deterministic classification
+    max_tokens: 10  # Only need "Ja" or "Nej"
+    top_p: 0.9
+    stop:
+      - "\n"  # Stop at newline
+      - "."  # Stop at period
+    
+  # For instance generation
+  instance:
+    temperature: 0.0  # Deterministic for instances
+    max_tokens: 350
+    top_p: 0.5
+    frequency_penalty: 0.0
+    presence_penalty: 1.5
+    stop:
+      - "Eksempel 6"  # Stop after 5 examples
+      - "Opgave:"
+    
+# Pipeline configuration
+pipeline:
+  # Number of instructions to generate per iteration
+  num_instructions_per_iteration: 100
+  
+  # Maximum total instructions to generate
+  max_total_instructions: 1000
+  
+  # Batch size for concurrent API calls (adjust based on your vLLM server capacity)
+  batch_size: 20
+  
+  # Number of examples to use in prompts
+  num_prompt_instructions: 8
+  
+  # Number of instances to generate per instruction
+  num_instances_per_instruction: 5
+  
+# Filtering configuration
+filtering:
+  # Minimum instruction length (characters)
+  min_instruction_length: 10
+  
+  # Maximum instruction length (characters)
+  max_instruction_length: 500
+  
+  # ROUGE-L threshold for similarity filtering
+  rouge_threshold: 0.7
+  
+  # Keywords to filter out
+  blacklist_keywords:
+    - "billede"
+    - "foto"
+    - "graf"
+    - "diagram"
+    - "tegning"
+    - "illustration"
+    
+# Data paths
+data:
+  seed_file: "data/seed_tasks.jsonl"
+  output_dir: "data/generated"
+  
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
