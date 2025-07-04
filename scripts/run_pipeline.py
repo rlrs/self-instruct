@@ -31,13 +31,14 @@ def setup_logging(level="INFO"):
     )
 
 
-def run_pipeline(config_path: str, output_dir: str, iterations: int = 1):
+def run_pipeline(config_path: str, output_dir: str, iterations: int = 1, continue_from: int = None):
     """Run the complete Self-Instruct pipeline with bootstrapping.
     
     Args:
         config_path: Path to configuration file
         output_dir: Base output directory
         iterations: Number of iterations to run
+        continue_from: If specified, continue from this iteration number
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -57,7 +58,31 @@ def run_pipeline(config_path: str, output_dir: str, iterations: int = 1):
     # Track total generated count for continuous ID numbering
     total_generated_count = 0
     
-    for iteration in range(iterations):
+    # If continuing from a specific iteration, load existing state
+    start_iteration = 0
+    if continue_from is not None:
+        start_iteration = continue_from
+        logger.info(f"Continuing from iteration {continue_from}")
+        
+        # Count existing instructions to maintain ID continuity
+        existing_count = 0
+        with open(cumulative_instructions_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                task = json.loads(line)
+                if task['id'].startswith('generated_task_'):
+                    existing_count += 1
+        
+        total_generated_count = existing_count
+        logger.info(f"Found {existing_count} existing generated instructions")
+        
+        # Collect existing generated files
+        for i in range(1, continue_from + 1):
+            iter_dir = output_path / f"iteration_{i}"
+            instances_file = iter_dir / "tasks_with_instances.jsonl"
+            if instances_file.exists():
+                all_generated_files.append(str(instances_file))
+    
+    for iteration in range(start_iteration, iterations):
         logger.info(f"\n{'='*50}")
         logger.info(f"Starting iteration {iteration + 1}/{iterations}")
         logger.info(f"{'='*50}\n")
@@ -167,6 +192,12 @@ Examples:
   # Run multiple iterations
   python scripts/run_pipeline.py --iterations 3
   
+  # Continue from iteration 5 and run to iteration 10
+  python scripts/run_pipeline.py --continue-from 5 --iterations 10
+  
+  # Just generate training data from existing iterations
+  python scripts/run_pipeline.py --continue-from 5 --iterations 5
+  
   # Use custom config
   python scripts/run_pipeline.py --config configs/custom.yaml
         """
@@ -189,6 +220,12 @@ Examples:
         help="Number of iterations to run"
     )
     parser.add_argument(
+        "--continue-from",
+        type=int,
+        default=None,
+        help="Continue from a specific iteration (e.g., --continue-from 3 to skip iterations 1-3)"
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -200,18 +237,18 @@ Examples:
     # Setup logging
     setup_logging(args.log_level)
     
-    # Check if vLLM server is running
-    logger.info("Checking vLLM server connection...")
+    # Check if model server is running
+    logger.info("Checking model server connection...")
     try:
         import yaml
         import aiohttp
         import asyncio
         
-        # Load config to get vLLM URL
+        # Load config to get server URL
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
         
-        base_url = config['vllm']['base_url']
+        base_url = config['server']['base_url']
         
         # Simple health check
         async def check_health():
@@ -222,13 +259,13 @@ Examples:
         is_healthy = asyncio.run(check_health())
         
         if is_healthy:
-            logger.info("vLLM server is running and accessible")
+            logger.info("Model server is running and accessible")
         else:
-            raise Exception("vLLM server health check failed")
+            raise Exception("Model server health check failed")
             
     except Exception as e:
-        logger.error(f"Failed to connect to vLLM server: {e}")
-        logger.error("Please ensure vLLM server is running at the configured URL")
+        logger.error(f"Failed to connect to model server: {e}")
+        logger.error("Please ensure model server is running at the configured URL")
         sys.exit(1)
     
     # Run pipeline
@@ -236,7 +273,8 @@ Examples:
         run_pipeline(
             config_path=args.config,
             output_dir=args.output_dir,
-            iterations=args.iterations
+            iterations=args.iterations,
+            continue_from=args.continue_from
         )
     except KeyboardInterrupt:
         logger.info("\nPipeline interrupted by user")

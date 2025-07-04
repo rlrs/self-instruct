@@ -11,7 +11,7 @@ import yaml
 from tqdm import tqdm
 import asyncio
 
-from src.simple_vllm_client import GenerationConfig, generate_many
+from src.openai_client import GenerationConfig, generate_many
 from src.utils.prompts import INSTRUCTION_GENERATION_PROMPT, format_instruction_examples
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,8 @@ class InstructionGenerator:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
             
-        self.base_url = self.config['vllm']['base_url']
-        self.model_name = self.config['vllm'].get('model_name')
+        self.base_url = self.config['server']['base_url']
+        self.model_name = self.config['server'].get('model_name')
         self.generation_config = GenerationConfig(**self.config['generation']['instruction'])
         self.rouge_scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
         
@@ -179,83 +179,117 @@ class InstructionGenerator:
             
         return prompts
         
-    async def generate_batch_async(self, num_instructions: int = 100) -> List[str]:
-        """Generate a batch of new instructions."""
-        generated_instructions = []
-        
-        pbar = tqdm(total=num_instructions, desc="Generating instructions")
-        
-        # Track statistics
-        total_generated = 0
-        filtered_by_quality = 0
-        filtered_by_similarity = 0
-        
-        while len(generated_instructions) < num_instructions:
-            remaining = num_instructions - len(generated_instructions)
+    async def generate_single_prompt_async(self, semaphore, generated_instructions, pbar, stats, target_count):
+        """Generate instructions from a single prompt."""
+        async with semaphore:
+            # Check if we've already reached our target
+            if stats['kept'] >= target_count:
+                return
+                
+            # Create a single prompt
+            prompts = self.create_prompts(1, 10)  # Generate ~10 instructions per prompt
+            prompt = prompts[0]
             
-            # Create multiple prompts to generate concurrently
-            # Generate fewer at once to avoid repetition
-            num_prompts = min(10, max(1, remaining // 5))  # Generate up to 10 prompts at once
-            num_per_prompt = min(10, remaining // num_prompts + 1)
-            
-            prompts = self.create_prompts(num_prompts, num_per_prompt)
-            
-            # Generate all at once - let vLLM handle the batching
             try:
+                # Use generate_many with a single prompt for consistency
                 responses = await generate_many(
-                    prompts,
+                    [prompt],
                     self.generation_config,
                     self.base_url,
                     self.model_name
                 )
                 
-                # Process all responses
-                for i, response in enumerate(responses):
-                    if not response:
-                        continue
-                        
-                    new_instructions = self.parse_generated_instructions(response)
-                    logger.debug(f"Prompt {i} generated {len(new_instructions)} instructions")
+                response = responses[0] if responses else None
+                if not response:
+                    return
                     
-                    # Filter and add valid instructions
-                    for instruction in new_instructions:
-                        total_generated += 1
-                        
-                        if not self.filter_instruction(instruction):
-                            filtered_by_quality += 1
-                            continue
-                            
-                        if not self.is_similar(instruction):
-                            generated_instructions.append(instruction)
-                            self.all_instructions.append(instruction)
-                            self.instruction_set.add(instruction.lower().strip())
-                            pbar.update(1)
-                            
-                            if len(generated_instructions) >= num_instructions:
-                                break
-                        else:
-                            filtered_by_similarity += 1
-                                
-                    if len(generated_instructions) >= num_instructions:
+                new_instructions = self.parse_generated_instructions(response)
+                logger.debug(f"Generated {len(new_instructions)} instructions")
+                
+                # Filter and add valid instructions
+                for instruction in new_instructions:
+                    # Check if we've reached target before processing each instruction
+                    if stats['kept'] >= target_count:
                         break
                         
-                # Update progress bar description with statistics
+                    stats['total_generated'] += 1
+                    
+                    if not self.filter_instruction(instruction):
+                        stats['filtered_by_quality'] += 1
+                        continue
+                        
+                    if not self.is_similar(instruction):
+                        generated_instructions.append(instruction)
+                        self.all_instructions.append(instruction)
+                        self.instruction_set.add(instruction.lower().strip())
+                        pbar.update(1)
+                        stats['kept'] += 1
+                    else:
+                        stats['filtered_by_similarity'] += 1
+                        
+                # Update progress bar description
                 pbar.set_description(
-                    f"Generating (kept: {len(generated_instructions)}, "
-                    f"filtered: {filtered_by_quality + filtered_by_similarity}/{total_generated})"
+                    f"Generating (kept: {stats['kept']}, "
+                    f"filtered: {stats['filtered_by_quality'] + stats['filtered_by_similarity']}/{stats['total_generated']})"
                 )
                         
             except Exception as e:
-                logger.error(f"Batch generation error: {e}")
-                continue
+                logger.error(f"Generation error: {e}", exc_info=True)
+    
+    async def generate_batch_async(self, num_instructions: int = 100) -> List[str]:
+        """Generate a batch of new instructions with high concurrency."""
+        generated_instructions = []
+        
+        pbar = tqdm(total=num_instructions, desc="Generating instructions")
+        
+        # Track statistics
+        stats = {
+            'total_generated': 0,
+            'filtered_by_quality': 0,
+            'filtered_by_similarity': 0,
+            'kept': 0
+        }
+        
+        # Use a semaphore to control concurrency
+        # vLLM can handle high concurrency, so we can be aggressive
+        max_concurrent = self.config.get('pipeline', {}).get('max_concurrent_requests', 100)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Generate more than needed to account for filtering
+        # Estimate based on typical filtering rate
+        overgenerate_factor = 2.0  # Generate 2x what we need
+        prompts_needed = int(num_instructions * overgenerate_factor / 10)  # ~10 instructions per prompt
+        
+        # Create all tasks upfront
+        tasks = []
+        for _ in range(prompts_needed):
+            task = self.generate_single_prompt_async(semaphore, generated_instructions, pbar, stats, num_instructions)
+            tasks.append(task)
+        
+        # Run all tasks concurrently
+        await asyncio.gather(*tasks)
+        
+        # If we still need more, generate additional ones
+        while (num_missing := num_instructions - len(generated_instructions)) > 0:
+            additional_tasks = []
+            for _ in range(2 * num_missing):
+                task = self.generate_single_prompt_async(semaphore, generated_instructions, pbar, stats, num_instructions)
+                additional_tasks.append(task)
+            
+            await asyncio.gather(*additional_tasks)
+            
+            # Break if we're not making progress
+            if stats['kept'] == len(generated_instructions):
+                logger.warning("Not making progress, stopping generation")
+                break
                 
         pbar.close()
         
         # Log final statistics
         logger.info(f"Generation statistics:")
-        logger.info(f"  Total generated: {total_generated}")
-        logger.info(f"  Filtered by quality: {filtered_by_quality}")
-        logger.info(f"  Filtered by similarity: {filtered_by_similarity}")
+        logger.info(f"  Total generated: {stats['total_generated']}")
+        logger.info(f"  Filtered by quality: {stats['filtered_by_quality']}")
+        logger.info(f"  Filtered by similarity: {stats['filtered_by_similarity']}")
         logger.info(f"  Kept: {len(generated_instructions)}")
         
         return generated_instructions[:num_instructions]

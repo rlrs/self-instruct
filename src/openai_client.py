@@ -1,4 +1,4 @@
-"""Simple async client for vLLM that leverages its built-in continuous batching."""
+"""Simple async client for OpenAI-compatible API servers."""
 
 import asyncio
 import aiohttp
@@ -46,9 +46,9 @@ async def generate(
     model_name: Optional[str] = None,
     debug: bool = False
 ) -> str:
-    """Send a single generation request to vLLM using completions endpoint.
+    """Send a single generation request using OpenAI-compatible completions endpoint.
     
-    vLLM will automatically batch this with other concurrent requests.
+    The server will automatically batch this with other concurrent requests.
     """
     data = {
         "prompt": prompt,
@@ -69,11 +69,24 @@ async def generate(
         ) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise Exception(f"Generation failed: {error_text}")
+                raise Exception(f"HTTP {response.status}: {error_text}")
                 
             result = await response.json()
-            text = result["choices"][0]["text"]
             
+            # Check if we got a valid response structure
+            if not result.get("choices") or not result["choices"]:
+                raise Exception(f"Invalid response structure: {result}")
+                
+            text = result["choices"][0].get("text", "")
+            
+            # Check for empty text
+            if not text or not text.strip():
+                logger.warning(f"Empty text in response. Full response: {json.dumps(result, indent=2)}")
+                finish_reason = result["choices"][0].get("finish_reason", "unknown")
+                logger.warning(f"Finish reason: {finish_reason}")
+                if debug:
+                    logger.warning(f"Request prompt: {prompt[:500]}...")
+                
             if debug:
                 logger.debug(f"Response text: '{text[:200]}...'")
                 
@@ -97,7 +110,7 @@ async def generate_many(
     Just sends all requests concurrently and lets vLLM handle the batching.
     """
     connector = aiohttp.TCPConnector(limit=max_concurrent)
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=300)  # Increase to 5 minutes
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         # Create all tasks
@@ -113,8 +126,8 @@ async def generate_many(
         outputs = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Failed to generate for prompt {i}: {result}")
-                outputs.append("")  # or handle differently
+                logger.error(f"Failed to generate for prompt {i}: {result}", exc_info=result)
+                outputs.append(None)  # Return None to indicate failure
             else:
                 outputs.append(result)
                 

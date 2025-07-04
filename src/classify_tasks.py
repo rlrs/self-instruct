@@ -8,7 +8,7 @@ import yaml
 from tqdm import tqdm
 import asyncio
 
-from src.simple_vllm_client import GenerationConfig, generate_many
+from src.openai_client import GenerationConfig, generate_many
 from src.utils.prompts import CLASSIFICATION_PROMPT, format_classification_examples
 
 logger = logging.getLogger(__name__)
@@ -66,8 +66,8 @@ class TaskClassifier:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
             
-        self.base_url = self.config['vllm']['base_url']
-        self.model_name = self.config['vllm'].get('model_name')
+        self.base_url = self.config['server']['base_url']
+        self.model_name = self.config['server'].get('model_name')
         self.generation_config = GenerationConfig(**self.config['generation']['classification'])
         
         # We don't need the Danish examples anymore with the simplified English prompt

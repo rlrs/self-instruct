@@ -10,10 +10,9 @@ from tqdm import tqdm
 import random
 import asyncio
 
-from src.simple_vllm_client import GenerationConfig, generate_many
+from src.openai_client import GenerationConfig, generate_many
 from src.utils.prompts import (
     INSTANCE_GENERATION_INPUT_FIRST_PROMPT,
-    INSTANCE_GENERATION_NO_INPUT_PROMPT,
     INSTANCE_GENERATION_OUTPUT_FIRST_PROMPT
 )
 
@@ -32,8 +31,8 @@ class InstanceGenerator:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
             
-        self.base_url = self.config['vllm']['base_url']
-        self.model_name = self.config['vllm'].get('model_name')
+        self.base_url = self.config['server']['base_url']
+        self.model_name = self.config['server'].get('model_name')
         self.generation_config = GenerationConfig(**self.config['generation']['instance'])
         
     def detect_if_input_needed(self, instruction: str) -> bool:
@@ -70,114 +69,127 @@ class InstanceGenerator:
         # Default: check if instruction references something that should be provided
         return has_input_keyword
         
-    def parse_instances(self, text: str, has_input: bool) -> List[Dict[str, str]]:
-        """Parse instances from base model generated text."""
+    def parse_input_output(self, text: str) -> Tuple[str, str]:
+        """Parse input and output from text using the original paper's approach."""
+        # Look for Output marker to split input/output
+        if re.findall(r"Output\s*\d*\s*:", text):
+            parts = re.split(r"Output\s*\d*\s*:", text, 1)
+            inst_input = parts[0].strip()
+            inst_output = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            # No Output marker found, treat everything as output with no input
+            inst_input = ""
+            inst_output = text.strip()
+            
+        # To avoid the case where multiple input/output pairs are generated
+        if re.findall(r"Input\s*\d*\s*:", inst_output):
+            inst_output = re.split(r"Input\s*\d*\s*:", inst_output)[0].strip()
+            
+        # Remove the prefix "Input:" from the input string if present
+        inst_input = re.sub(r"^Input\s*\d*\s*:", "", inst_input).strip()
+        
+        return inst_input, inst_output
+    
+    def parse_instances(self, text: str, generation_method: str = 'input_first') -> List[Dict[str, str]]:
+        """Parse instances from base model generated text matching the original paper's approach."""
         instances = []
+        text = text.strip()
         
-        # Base model continues from our prompt
-        # Split by "Eksempel" to get individual examples
-        examples = re.split(r'Eksempel\s*\d+:', text)
-        
-        for example in examples:
-            example = example.strip()
-            if not example:
-                continue
-                
-            if has_input:
-                # Look for Input: ... Output: ... pattern
-                match = re.search(r'Input:\s*(.+?)\s*Output:\s*(.+?)(?=$)', example, re.DOTALL)
-                if match:
-                    instances.append({
-                        'input': match.group(1).strip(),
-                        'output': match.group(2).strip()
-                    })
-            else:
-                # For no-input tasks, the whole example is the output
-                output = example.strip()
-                # Remove "Output:" prefix if present
-                output = re.sub(r'^Output:\s*', '', output)
-                if output and len(output.split()) > 2:  # Basic quality check
-                    instances.append({
-                        'input': "",
-                        'output': output
-                    })
-                    
-        # Strategy 2: Look for Input:/Output: pairs without example numbers
-        if not instances and has_input:
-            pattern = r'Input:\s*(.+?)\s*Output:\s*(.+?)(?=Input:|$)'
-            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+        # Check if we have Example markers
+        if re.findall(r"Eksempel\s*\d*\.?", text):
+            # Split by Example markers
+            instance_texts = re.split(r"Eksempel\s*\d*\.?", text)
+            instance_texts = [it.strip() for it in instance_texts if it.strip()]
             
-            for input_text, output_text in matches:
+            for instance_text in instance_texts:
+                inst_input, inst_output = self.parse_input_output(instance_text)
+                if inst_output:  # Only add if we have output
+                    instances.append({
+                        'input': inst_input,
+                        'output': inst_output
+                    })
+        elif re.findall(r"Output\s*\d*\s*:", text):
+            # No Example markers but has Output marker - parse as single instance
+            inst_input, inst_output = self.parse_input_output(text)
+            if inst_output:
                 instances.append({
-                    'input': input_text.strip(),
-                    'output': output_text.strip()
+                    'input': inst_input,
+                    'output': inst_output
                 })
-                
-        # Strategy 3: For no-input tasks, look for standalone outputs
-        if not instances and not has_input:
-            pattern = r'Output:\s*(.+?)(?=Output:|Eksempel|$)'
-            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-            
-            for output_text in matches:
-                output_text = output_text.strip()
-                if output_text:
-                    instances.append({
-                        'input': "",
-                        'output': output_text
-                    })
-                    
+        else:
+            # No markers at all - treat entire text as output
+            # This handles cases where model continues directly after "Output:" in prompt
+            if text:
+                instances.append({
+                    'input': "",
+                    'output': text
+                })
+        
         return instances
         
     def parse_classification_instances(self, text: str) -> Tuple[List[str], List[Dict[str, str]]]:
-        """Parse instances from classification task generation - base model style."""
+        """Parse instances from classification task generation matching the original paper's approach."""
         categories = []
         instances = []
         
-        # For base model, we use output-first approach
-        # First line after "Klasse:" contains the categories
-        lines = text.strip().split('\n')
-        if lines:
-            # Extract unique categories from the generated text
-            for line in lines:
-                if ':' in line:
-                    # This might be a category definition
-                    parts = line.split(':', 1)
-                    if len(parts) > 1:
-                        cat = parts[1].strip()
-                        if cat and cat not in categories:
-                            categories.append(cat)
-                        
-        # Parse instances - for classification, we generate output-first
-        # So we need to reconstruct the instances
-        instances = self.parse_instances(text, has_input=True)
+        # Check if we have the expected "Klasseetiket:" marker
+        if "Klasseetiket:" not in text:
+            # Fallback to regular parsing if format is unexpected
+            return [], self.parse_instances(text, generation_method='output_first')
+        
+        # Split by "Klasseetiket:" to get each instance
+        instance_texts = text.split("Klasseetiket:")[1:]  # Skip the part before first marker
+        
+        for instance_text in instance_texts:
+            instance_text = instance_text.strip()
+            if not instance_text:
+                continue
+                
+            # Split by newline - first line is the class label, rest is the input
+            lines = instance_text.split('\n', 1)
+            
+            if len(lines) >= 1:
+                # First line is the class label (output)
+                class_label = lines[0].strip()
+                if class_label and class_label not in categories:
+                    categories.append(class_label)
+                
+                # Rest is the input (if any)
+                if len(lines) > 1:
+                    input_text = lines[1].strip()
+                else:
+                    input_text = ""
+                
+                # For classification, output is the class label, input is the text to classify
+                if class_label:
+                    instances.append({
+                        'input': input_text,
+                        'output': class_label
+                    })
         
         return categories, instances
         
     def generate_instances_input_first(self, instruction: str, num_instances: int) -> List[Dict[str, str]]:
-        """Generate instances using input-first approach."""
+        """Generate instances using input-first approach for all non-classification tasks."""
         prompt = INSTANCE_GENERATION_INPUT_FIRST_PROMPT.format(
-            instruction=instruction,
-            num_instances=num_instances
+            instruction=instruction
         )
         
         try:
-            response = self.client.generate(prompt, self.generation_config)
-            instances = self.parse_instances(response, has_input=True)
-            return instances[:num_instances]
-        except Exception as e:
-            logger.error(f"Error generating instances: {e}")
-            return []
+            # Always log the first few for debugging
+            logger.info(f"Generating instances for instruction: {instruction[:100]}...")
+            logger.info(f"Prompt ending: ...{prompt[-200:]}")
             
-    def generate_instances_no_input(self, instruction: str, num_instances: int) -> List[Dict[str, str]]:
-        """Generate instances for tasks without input."""
-        prompt = INSTANCE_GENERATION_NO_INPUT_PROMPT.format(
-            instruction=instruction,
-            num_instances=num_instances
-        )
-        
-        try:
             response = self.client.generate(prompt, self.generation_config)
-            instances = self.parse_instances(response, has_input=False)
+            
+            logger.info(f"Raw response (first 300 chars): {response[:300]}")
+            logger.info(f"Response length: {len(response)} characters")
+            
+            instances = self.parse_instances(response, generation_method='input_first')
+            logger.info(f"Parsed {len(instances)} instances")
+            if instances:
+                logger.info(f"First instance: {instances[0]}")
+            
             return instances[:num_instances]
         except Exception as e:
             logger.error(f"Error generating instances: {e}")
@@ -186,8 +198,7 @@ class InstanceGenerator:
     def generate_instances_output_first(self, instruction: str, num_instances: int) -> List[Dict[str, str]]:
         """Generate instances using output-first approach for classification tasks."""
         prompt = INSTANCE_GENERATION_OUTPUT_FIRST_PROMPT.format(
-            instruction=instruction,
-            num_instances=num_instances
+            instruction=instruction
         )
         
         try:
@@ -219,19 +230,14 @@ class InstanceGenerator:
             # Use output-first approach for classification
             instances = self.generate_instances_output_first(instruction, num_instances)
         else:
-            # Detect if input is needed
-            needs_input = self.detect_if_input_needed(instruction)
-            
-            if needs_input:
-                instances = self.generate_instances_input_first(instruction, num_instances)
-            else:
-                instances = self.generate_instances_no_input(instruction, num_instances)
+            # Use input-first approach for all non-classification tasks
+            instances = self.generate_instances_input_first(instruction, num_instances)
                 
         # Update task with instances
         task['instances'] = instances
         task['metadata'] = task.get('metadata', {})
         task['metadata']['num_instances_generated'] = len(instances)
-        task['metadata']['generation_method'] = 'output_first' if is_classification else ('input_first' if self.detect_if_input_needed(instruction) else 'no_input')
+        task['metadata']['generation_method'] = 'output_first' if is_classification else 'input_first'
         
         return task
         
@@ -255,37 +261,41 @@ class InstanceGenerator:
             # Determine prompt based on task type
             if is_classification:
                 prompt = INSTANCE_GENERATION_OUTPUT_FIRST_PROMPT.format(
-                    instruction=instruction,
-                    num_instances=num_instances
+                    instruction=instruction
                 )
                 generation_method = 'output_first'
             else:
-                needs_input = self.detect_if_input_needed(instruction)
-                if needs_input:
-                    prompt = INSTANCE_GENERATION_INPUT_FIRST_PROMPT.format(
-                        instruction=instruction,
-                        num_instances=num_instances
-                    )
-                    generation_method = 'input_first'
-                else:
-                    prompt = INSTANCE_GENERATION_NO_INPUT_PROMPT.format(
-                        instruction=instruction,
-                        num_instances=num_instances
-                    )
-                    generation_method = 'no_input'
+                prompt = INSTANCE_GENERATION_INPUT_FIRST_PROMPT.format(
+                    instruction=instruction
+                )
+                generation_method = 'input_first'
             
             prompts.append(prompt)
             prompt_metadata.append({
                 'task_index': i,
                 'is_classification': is_classification,
-                'generation_method': generation_method,
-                'needs_input': generation_method != 'no_input'
+                'generation_method': generation_method
             })
             tasks_to_generate.append(task)
         
         if not prompts:
             logger.info("All tasks already have instances, skipping generation")
             return tasks
+        
+        # Save first few prompts for debugging
+        debug_dir = Path("debug_prompts")
+        debug_dir.mkdir(exist_ok=True)
+        for i, (prompt, task) in enumerate(zip(prompts[:5], tasks_to_generate[:5])):
+            debug_file = debug_dir / f"instance_prompt_{i}_{task['id']}.txt"
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                f.write(f"Task ID: {task['id']}\n")
+                f.write(f"Instruction: {task['instruction']}\n")
+                f.write(f"Is Classification: {task.get('is_classification', False)}\n")
+                f.write(f"Generation Method: {prompt_metadata[i]['generation_method']}\n")
+                f.write(f"\n{'='*80}\nFULL PROMPT:\n{'='*80}\n\n")
+                f.write(prompt)
+                f.write(f"\n\n{'='*80}\nEND OF PROMPT\n{'='*80}\n")
+            logger.info(f"Saved debug prompt to {debug_file}")
         
         # Generate all instances at once
         logger.info(f"Generating instances for {len(prompts)} tasks...")
@@ -297,25 +307,60 @@ class InstanceGenerator:
         )
         
         # Process responses
-        for task, response, metadata in zip(tasks_to_generate, responses, prompt_metadata):
-            if not response:
-                logger.error(f"Instance generation failed for task {task['id']}")
-                continue
+        for i, (task, response, metadata) in enumerate(zip(tasks_to_generate, responses, prompt_metadata)):
+            try:
+                if not response:
+                    logger.error(f"Instance generation failed for task {task['id']}: Empty response from model")
+                    logger.error(f"  Instruction: {task['instruction'][:100]}...")
+                    logger.error(f"  Is classification: {metadata['is_classification']}")
+                    logger.error(f"  Generation method: {metadata['generation_method']}")
+                    task['instances'] = []
+                    task['metadata'] = task.get('metadata', {})
+                    task['metadata']['num_instances_generated'] = 0
+                    task['metadata']['generation_failed'] = True
+                    task['metadata']['failure_reason'] = "Empty response from model"
+                    continue
                 
-            # Parse instances based on generation method
-            if metadata['is_classification']:
-                _, instances = self.parse_classification_instances(response)
-            else:
-                instances = self.parse_instances(
-                    response, 
-                    has_input=metadata['needs_input']
-                )
-            
-            # Update task
-            task['instances'] = instances[:num_instances]
-            task['metadata'] = task.get('metadata', {})
-            task['metadata']['num_instances_generated'] = len(instances)
-            task['metadata']['generation_method'] = metadata['generation_method']
+                # Save responses for debugging
+                if i < 5:
+                    debug_file = debug_dir / f"instance_response_{i}_{task['id']}.txt"
+                    with open(debug_file, 'w', encoding='utf-8') as f:
+                        f.write(f"Task ID: {task['id']}\n")
+                        f.write(f"Instruction: {task['instruction']}\n")
+                        f.write(f"Is Classification: {metadata['is_classification']}\n")
+                        f.write(f"Generation Method: {metadata['generation_method']}\n")
+                        f.write(f"\n{'='*80}\nRESPONSE:\n{'='*80}\n\n")
+                        f.write(response if response else "[EMPTY RESPONSE]")
+                        f.write(f"\n\n{'='*80}\nEND OF RESPONSE\n{'='*80}\n")
+                    logger.info(f"Saved debug response to {debug_file}")
+                    
+                # Parse instances based on generation method
+                if metadata['is_classification']:
+                    _, instances = self.parse_classification_instances(response)
+                else:
+                    # For input_first template, parse both input and no-input cases
+                    instances = self.parse_instances(response, generation_method='input_first')
+                
+                # Update task
+                task['instances'] = instances[:num_instances]
+                task['metadata'] = task.get('metadata', {})
+                task['metadata']['num_instances_generated'] = len(instances)
+                task['metadata']['generation_method'] = metadata['generation_method']
+                
+                # Debug logging for first few tasks
+                if i < 3 and instances:
+                    logger.info(f"Parsed {len(instances)} instances, first: {instances[0]}")
+                
+                if not instances:
+                    logger.warning(f"No instances parsed for task {task['id']} from response: {response[:200]}...")
+                    
+            except Exception as e:
+                logger.error(f"Error processing response for task {task['id']}: {str(e)}", exc_info=True)
+                task['instances'] = []
+                task['metadata'] = task.get('metadata', {})
+                task['metadata']['num_instances_generated'] = 0
+                task['metadata']['generation_failed'] = True
+                task['metadata']['failure_reason'] = str(e)
         
         return tasks
     

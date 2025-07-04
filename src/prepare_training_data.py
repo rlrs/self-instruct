@@ -72,54 +72,58 @@ class TrainingDataProcessor:
         return unique_instances
         
     def format_for_training(self, task: Dict, instance: Dict[str, str]) -> List[Dict[str, str]]:
-        """Format a task instance for training with multiple templates."""
+        """Format a task instance for training with random template selection."""
         instruction = task['instruction']
         input_text = instance.get('input', '')
         output_text = instance.get('output', '')
         
-        formatted_examples = []
-        
-        # Template 1: Direct instruction
+        # Define templates matching the original paper's approach
         if input_text:
-            prompt1 = f"{instruction}\n\n{input_text}"
+            # Templates for tasks WITH input
+            templates_with_input = [
+                # Explicit Input/Output labels
+                ("{instruction}\nInput: {input}\nOutput:", " {output}"),
+                ("{instruction}\n\nInput: {input}\n\nOutput:", " {output}"),
+                ("Opgave: {instruction}\nInput: {input}\nOutput:", " {output}"),
+                # Danish variations with different labels
+                ("Instruktion: {instruction}\n\nInput: {input}\n\nSvar:", " {output}"),
+                ("{instruction}\n\nTekst: {input}\n\nSvar:", " {output}"),
+                # No Input label
+                ("{instruction}\n\n{input}\n\nOutput:", " {output}"),
+                ("{instruction}\n\n{input}\n\n", "{output}"),
+                ("{instruction}\n{input}\n\n", "{output}"),
+                ("Opgave: {instruction}\n\n{input}\n\n", "{output}"),
+            ]
+            prompt_template, completion_template = random.choice(templates_with_input)
+            prompt = prompt_template.format(instruction=instruction.strip(), input=input_text.strip())
+            completion = completion_template.format(output=output_text.strip())
         else:
-            prompt1 = instruction
-        formatted_examples.append({
-            "prompt": prompt1,
-            "completion": output_text
-        })
+            # Templates for tasks WITHOUT input
+            templates_without_input = [
+                # With Output/Svar label
+                ("{instruction} Output:", " {output}"),
+                ("{instruction}\nOutput:", " {output}"),
+                ("{instruction}\n\nOutput:", " {output}"),
+                ("{instruction}\nSvar:", " {output}"),
+                ("{instruction}\n\nSvar:", " {output}"),
+                # With prefix
+                ("Opgave: {instruction}\n\nSvar:", " {output}"),
+                ("Instruktion: {instruction}\n\nOutput:", " {output}"),
+                ("Spørgsmål: {instruction}\nSvar:", " {output}"),
+                # No label
+                ("{instruction}\n", "{output}"),
+                ("{instruction}\n\n", "{output}"),
+                ("Opgave: {instruction}\n\n", "{output}"),
+            ]
+            prompt_template, completion_template = random.choice(templates_without_input)
+            prompt = prompt_template.format(instruction=instruction.strip())
+            completion = completion_template.format(output=output_text.strip())
         
-        # Template 2: With "Instruktion:" prefix
-        if input_text:
-            prompt2 = f"Instruktion: {instruction}\n\nInput: {input_text}"
-        else:
-            prompt2 = f"Instruktion: {instruction}"
-        formatted_examples.append({
-            "prompt": prompt2,
-            "completion": output_text
-        })
-        
-        # Template 3: With "Opgave:" prefix and "Svar:" for output
-        if input_text:
-            prompt3 = f"Opgave: {instruction}\n\nTekst: {input_text}\n\nSvar:"
-        else:
-            prompt3 = f"Opgave: {instruction}\n\nSvar:"
-        formatted_examples.append({
-            "prompt": prompt3,
-            "completion": f" {output_text}"
-        })
-        
-        # Template 4: Question-Answer format
-        if input_text:
-            prompt4 = f"Spørgsmål: {instruction}\nKontekst: {input_text}\nSvar:"
-        else:
-            prompt4 = f"Spørgsmål: {instruction}\nSvar:"
-        formatted_examples.append({
-            "prompt": prompt4,
-            "completion": f" {output_text}"
-        })
-        
-        return formatted_examples
+        # Return single formatted example (not a list)
+        return [{
+            "prompt": prompt,
+            "completion": completion
+        }]
         
     def process_tasks(self, tasks: List[Dict]) -> Tuple[List[Dict], Dict]:
         """Process tasks and generate training examples."""

@@ -1,7 +1,7 @@
 # Default configuration for Self-Instruct pipeline
 
-# vLLM server configuration
-vllm:
+# Model server configuration
+server:
   base_url: "http://localhost:8000"
   model_name: "google/gemma-3-27b-pt"  # Base pre-trained model
   
@@ -10,10 +10,10 @@ generation:
   # For instruction generation
   instruction:
     temperature: 0.7
-    max_tokens: 1024
+    max_tokens: 2048
     top_p: 0.5
     frequency_penalty: 0.0
-    presence_penalty: 2.0  # Strong penalty like original paper
+    presence_penalty: 2.0
     stop:
       - "\n\n"
       - "\n16"
@@ -32,7 +32,7 @@ generation:
   # For instance generation
   instance:
     temperature: 0.0  # Deterministic for instances
-    max_tokens: 350
+    max_tokens: 1000
     top_p: 0.5
     frequency_penalty: 0.0
     presence_penalty: 1.5
@@ -43,13 +43,13 @@ generation:
 # Pipeline configuration
 pipeline:
   # Number of instructions to generate per iteration
-  num_instructions_per_iteration: 100
+  num_instructions_per_iteration: 5000
   
   # Maximum total instructions to generate
-  max_total_instructions: 1000
+  max_total_instructions: 20000
   
   # Batch size for concurrent API calls (adjust based on your vLLM server capacity)
-  batch_size: 20
+  batch_size: 200
   
   # Number of examples to use in prompts
   num_prompt_instructions: 8
@@ -60,10 +60,10 @@ pipeline:
 # Filtering configuration
 filtering:
   # Minimum instruction length (characters)
-  min_instruction_length: 10
+  min_instruction_length: 15
   
   # Maximum instruction length (characters)
-  max_instruction_length: 500
+  max_instruction_length: 1000
   
   # ROUGE-L threshold for similarity filtering
   rouge_threshold: 0.7

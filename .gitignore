@@ -8,3 +8,28 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
+
+# Project-specific directories
+data/
+vllm/
+analysis/
+debug_prompts/
+sparse_logs/
+todos/
+
+# Logs
+*.log
+pipeline.log
+
+# Temporary files
+*.tmp
+*.temp
+debug_*.py
+
+# Excel files (source data)
+*.xlsx
+
+# Python version file
+.python-version
